@@ -1,4 +1,5 @@
-# pi-controls
+# pi-control
+
 
 A [pi](https://github.com/earendil-works/pi) extension that enforces action-based policies on tool calls, scoped by filesystem location.
 
@@ -42,7 +43,7 @@ pi-controls is installed via pi's built-in package manager using the `git:` sour
 ### Global install (all projects)
 
 ```sh
-pi install git:github.com/mcowger/pi-controls
+pi install git:github.com/mcowger/pi-control
 ```
 
 This clones the repo, runs `bun install`, and records the package in `~/.pi/agent/settings.json`. The extension is active in every pi session.
@@ -50,7 +51,7 @@ This clones the repo, runs `bun install`, and records the package in `~/.pi/agen
 ### Project-local install
 
 ```sh
-pi install git:github.com/mcowger/pi-controls --local
+pi install git:github.com/mcowger/pi-control --local
 ```
 
 Same as above but records the package in `.pi/settings.json` in the current directory. Only active when pi runs from that project.
@@ -60,23 +61,23 @@ Same as above but records the package in `.pi/settings.json` in the current dire
 Append `@<ref>` to pin to a branch, tag, or commit. Pinned packages are excluded from `pi update`.
 
 ```sh
-pi install git:github.com/mcowger/pi-controls@v1.0.0
-pi install git:github.com/mcowger/pi-controls@main
-pi install git:github.com/mcowger/pi-controls@abc1234
+pi install git:github.com/mcowger/pi-control@v1.0.0
+pi install git:github.com/mcowger/pi-control@main
+pi install git:github.com/mcowger/pi-control@abc1234
 ```
 
 ### Updating
 
 ```sh
 pi update                             # update all packages
-pi update git:github.com/mcowger/pi-controls  # update this package only
+pi update git:github.com/mcowger/pi-control  # update this package only
 ```
 
 ### Removing
 
 ```sh
-pi remove git:github.com/mcowger/pi-controls
-pi remove git:github.com/mcowger/pi-controls --local  # project-local
+pi remove git:github.com/mcowger/pi-control
+pi remove git:github.com/mcowger/pi-control --local  # project-local
 ```
 
 ---
@@ -85,15 +86,15 @@ pi remove git:github.com/mcowger/pi-controls --local  # project-local
 
 If no config file is found at startup, pi-controls fails open — all tool calls proceed unrestricted. A warning notification is shown in the pi UI to make clear the extension is active but unconfigured:
 
-> `[pi-controls] No config found — all tool calls are unrestricted. Create ~/.pi/agent/extensions/pi-controls.jsonc to enforce policies.`
+> `[pi-control] No config found — all tool calls are unrestricted. Create ~/.pi/agent/extensions/pi-control.jsonc to enforce policies.`
 
-The startup entry in `~/.pi/agent/extensions/pi-controls.log` will show `loaded: 0 policies, 0 locations, defaultPolicy=null`.
+The startup entry in `~/.pi/agent/extensions/pi-control.log` will show `loaded: 0 policies, 0 locations, defaultPolicy=null`.
 
 ---
 
 ## Quick Start
 
-Create `~/.pi/agent/extensions/pi-controls.json`:
+Create `~/.pi/agent/extensions/pi-control.json`:
 
 ```json
 {
@@ -124,8 +125,8 @@ pi-controls loads config from two places and deep-merges them. **Project-local w
 
 | Scope | Path |
 |-------|------|
-| Global | `~/.pi/agent/extensions/pi-controls.jsonc` |
-| Project-local | `.pi/extensions/pi-controls.jsonc` (walks up from CWD) |
+| Global | `~/.pi/agent/extensions/pi-control.jsonc` |
+| Project-local | `.pi/extensions/pi-control.jsonc` (walks up from CWD) |
 
 Config files use **JSONC** (JSON with Comments), so `//` and `/* */` comments are supported. Plain `.json` is also accepted as a fallback.
 
@@ -133,7 +134,7 @@ See [`examples/sample.jsonc`](examples/sample.jsonc) for a fully annotated start
 
 This means you can define your base policies globally and override or extend them per project.
 
-**Global** (`~/.pi/agent/extensions/pi-controls.jsonc`):
+**Global** (`~/.pi/agent/extensions/pi-control.jsonc`):
 ```json
 {
   "policies": {
@@ -150,7 +151,7 @@ This means you can define your base policies globally and override or extend the
 }
 ```
 
-**Project-local** (`.pi/extensions/pi-controls.jsonc` at project root):
+**Project-local** (`.pi/extensions/pi-control.jsonc` at project root):
 ```json
 {
   "policies": {
