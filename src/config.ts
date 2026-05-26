@@ -12,8 +12,8 @@ import { existsSync, statSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import stripJsonComments from "strip-json-comments";
+import { getAgentDir } from "./pi-compat.js";
 import { SAFE_BASH_PATTERNS } from "./utils/safe-commands.js";
 
 // ─── Schema types ─────────────────────────────────────────────────────────────
@@ -103,14 +103,16 @@ function findLocalPath(): string | null {
 	const home = homedir();
 	while (true) {
 		if (dir === home) break;
-		const piDir = resolve(dir, ".pi");
-		if (existsSync(piDir) && statSync(piDir).isDirectory()) {
-			for (const name of FILENAMES) {
-				const p = resolve(piDir, `extensions/${name}`);
-				if (existsSync(p)) return p;
+		for (const dirName of [".omp", ".pi"]) {
+			const piDir = resolve(dir, dirName);
+			if (existsSync(piDir) && statSync(piDir).isDirectory()) {
+				for (const name of FILENAMES) {
+					const p = resolve(piDir, `extensions/${name}`);
+					if (existsSync(p)) return p;
+				}
+				// Not found yet — return the canonical .jsonc path for writes.
+				return resolve(piDir, "extensions/pi-controls.jsonc");
 			}
-			// Not found yet — return the canonical .jsonc path for writes.
-			return resolve(piDir, "extensions/pi-controls.jsonc");
 		}
 		const parent = resolve(dir, "..");
 		if (parent === dir) break;

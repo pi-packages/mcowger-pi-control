@@ -1,7 +1,8 @@
-import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { createConfigLoader } from "./config.js";
 import { handleToolCall } from "./hooks/tool-call.js";
+import { getAgentDir } from "./pi-compat.js";
 import { initBashParser } from "./utils/bash-ast.js";
 import { logStartup } from "./utils/logger.js";
 
@@ -84,7 +85,7 @@ export default async function piControls(pi: ExtensionAPI): Promise<void> {
 			);
 			if (policyCount === 0 && locationCount === 0) {
 				ctx.ui.notify(
-					"[pi-controls] No config found — all tool calls are unrestricted. Create ~/.pi/agent/extensions/pi-controls.jsonc to enforce policies.",
+					`[pi-controls] No config found — all tool calls are unrestricted. Create ${getAgentDir()}/extensions/pi-controls.jsonc to enforce policies.`,
 					"warning",
 				);
 			}
