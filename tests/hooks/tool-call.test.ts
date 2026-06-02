@@ -1,6 +1,6 @@
 import { describe, expect, it, beforeAll, beforeEach, mock } from "bun:test"; // mock kept for ctx stubs
 import { initBashParser } from "../../src/utils/bash-ast.js";
-import { handleToolCall, pendingNudges, denyTracker } from "../../src/hooks/tool-call.js";
+import { handleToolCall, pendingNudges, denyTracker, nudgeTrackers, nudgeKey } from "../../src/hooks/tool-call.js";
 import type { ControlsResolvedConfig } from "../../src/config.js";
 import type {
 	BashToolCallEvent,
@@ -62,6 +62,7 @@ const config: ControlsResolvedConfig = {
 	},
 	defaultPolicy: "locked",
 	agentTimeout: null,
+	nudgeTimeout: null,
 };
 
 describe("tool-call handler — path arg location resolution", () => {
@@ -145,6 +146,7 @@ describe("nudge action", () => {
 		locations: { "/tmp": "nudged" },
 		defaultPolicy: null,
 		agentTimeout: null,
+		nudgeTimeout: null,
 	};
 
 	it("allows the tool call (returns undefined) when action is nudge", async () => {
@@ -181,6 +183,7 @@ describe("agentTimeout escalation (deny → ask)", () => {
 		locations: {},
 		defaultPolicy: "locked",
 		agentTimeout: { maxDenies: 3, windowSeconds: 60 },
+		nudgeTimeout: null,
 	};
 
 	// Config without agentTimeout — baseline to confirm deny stays deny.
@@ -247,5 +250,159 @@ describe("agentTimeout escalation (deny → ask)", () => {
 		const r4 = await handleToolCall(bashEvent("rm /"), ctx, timeoutConfig);
 		expect(r4).toBeUndefined(); // confirm returned true
 		expect((ctx.ui.confirm as ReturnType<typeof mock>).mock.calls.length).toBe(2);
+	});
+});
+
+describe("nudgeTimeout escalation (nudge → deny)", () => {
+	const nudgeMsg = "use pluck_read instead";
+
+	const nudgeTimeoutConfig: ControlsResolvedConfig = {
+		policies: {
+			nudged: {
+				defaultAction: "allow",
+				rules: [
+					{
+						action: "nudge",
+						tool: "read",
+						message: nudgeMsg,
+					},
+				],
+			},
+		},
+		locations: { "/tmp": "nudged" },
+		defaultPolicy: null,
+		agentTimeout: null,
+		nudgeTimeout: { maxNudges: 3, windowSeconds: 60 },
+	};
+
+	const noNudgeTimeoutConfig: ControlsResolvedConfig = {
+		...nudgeTimeoutConfig,
+		nudgeTimeout: null,
+	};
+
+	beforeEach(() => {
+		pendingNudges.clear();
+		nudgeTrackers.clear();
+	});
+
+	it("allows (nudges) below the threshold", async () => {
+		const ctx = makeCtx("/tmp");
+		for (let i = 0; i < 2; i++) {
+			const r = await handleToolCall(
+				toolEvent("read", `id-${i}`, { path: "/tmp/foo.ts" }),
+				ctx,
+				nudgeTimeoutConfig,
+			);
+			expect(r).toBeUndefined(); // still nudging — not blocked
+		}
+	});
+
+	it("escalates to deny on the Nth nudge that meets the threshold", async () => {
+		const ctx = makeCtx("/tmp");
+		// First two: normal nudges.
+		await handleToolCall(toolEvent("read", "nt-1", { path: "/tmp/foo.ts" }), ctx, nudgeTimeoutConfig);
+		await handleToolCall(toolEvent("read", "nt-2", { path: "/tmp/foo.ts" }), ctx, nudgeTimeoutConfig);
+
+		// Third nudge hits maxNudges=3 → deny.
+		const r3 = await handleToolCall(
+			toolEvent("read", "nt-3", { path: "/tmp/foo.ts" }),
+			ctx,
+			nudgeTimeoutConfig,
+		);
+		expect(r3).toEqual({ block: true, reason: expect.stringContaining("Access denied") });
+	});
+
+	it("deny reason mentions the ignored nudge message", async () => {
+		const ctx = makeCtx("/tmp");
+		await handleToolCall(toolEvent("read", "nm-1", { path: "/tmp/foo.ts" }), ctx, nudgeTimeoutConfig);
+		await handleToolCall(toolEvent("read", "nm-2", { path: "/tmp/foo.ts" }), ctx, nudgeTimeoutConfig);
+		const r3 = await handleToolCall(
+			toolEvent("read", "nm-3", { path: "/tmp/foo.ts" }),
+			ctx,
+			nudgeTimeoutConfig,
+		);
+		expect(r3?.reason).toContain(nudgeMsg);
+		expect(r3?.reason).toContain("You MUST switch approach now");
+	});
+
+	it("resets the counter after escalation, allowing nudges again", async () => {
+		const ctx = makeCtx("/tmp");
+		// Trigger escalation (3 nudges).
+		await handleToolCall(toolEvent("read", "rs-1", { path: "/tmp/foo.ts" }), ctx, nudgeTimeoutConfig);
+		await handleToolCall(toolEvent("read", "rs-2", { path: "/tmp/foo.ts" }), ctx, nudgeTimeoutConfig);
+		await handleToolCall(toolEvent("read", "rs-3", { path: "/tmp/foo.ts" }), ctx, nudgeTimeoutConfig); // deny + reset
+
+		// After reset the 4th call should nudge again (not deny).
+		const r4 = await handleToolCall(
+			toolEvent("read", "rs-4", { path: "/tmp/foo.ts" }),
+			ctx,
+			nudgeTimeoutConfig,
+		);
+		expect(r4).toBeUndefined();
+		expect(pendingNudges.get("rs-4")).toBe(nudgeMsg);
+	});
+
+	it("does not escalate when nudgeTimeout is null", async () => {
+		const ctx = makeCtx("/tmp");
+		for (let i = 0; i < 5; i++) {
+			const r = await handleToolCall(
+				toolEvent("read", `nn-${i}`, { path: "/tmp/foo.ts" }),
+				ctx,
+				noNudgeTimeoutConfig,
+			);
+			expect(r).toBeUndefined(); // always nudge, never deny
+		}
+	});
+
+	it("tracks separate counters per rule (tool key)", async () => {
+		// Build a config with two nudge rules: read and grep.
+		const twoRuleConfig: ControlsResolvedConfig = {
+			policies: {
+				nudged: {
+					defaultAction: "allow",
+					rules: [
+						{ action: "nudge", tool: "read", message: "use pluck_read" },
+						{ action: "nudge", tool: "grep", message: "use pluck_grep" },
+					],
+				},
+			},
+			locations: { "/tmp": "nudged" },
+			defaultPolicy: null,
+			agentTimeout: null,
+			nudgeTimeout: { maxNudges: 2, windowSeconds: 60 },
+		};
+
+		const ctx = makeCtx("/tmp");
+		// Trigger 2 read nudges — hits threshold for "read".
+		await handleToolCall(toolEvent("read", "tr-1", { path: "/tmp/a" }), ctx, twoRuleConfig);
+		const r2 = await handleToolCall(toolEvent("read", "tr-2", { path: "/tmp/a" }), ctx, twoRuleConfig);
+		expect(r2).toEqual({ block: true, reason: expect.stringContaining("Access denied") });
+
+		// grep counter is independent — first grep should still nudge.
+		const grepR = await handleToolCall(toolEvent("grep", "tr-g1"), ctx, twoRuleConfig);
+		expect(grepR).toBeUndefined();
+	});
+
+	it("escalates bash nudge rules by pattern key", async () => {
+		const bashNudgeConfig: ControlsResolvedConfig = {
+			policies: {
+				cwd: {
+					defaultAction: "allow",
+					rules: [
+						{ action: "nudge", tool: "bash", pattern: "cat *", message: "use pluck_read over cat" },
+					],
+				},
+			},
+			locations: { "/tmp": "cwd" },
+			defaultPolicy: null,
+			agentTimeout: null,
+			nudgeTimeout: { maxNudges: 2, windowSeconds: 60 },
+		};
+
+		const ctx = makeCtx("/tmp");
+		await handleToolCall(bashEvent("cat /tmp/foo"), ctx, bashNudgeConfig);
+		const r2 = await handleToolCall(bashEvent("cat /tmp/bar"), ctx, bashNudgeConfig);
+		expect(r2).toEqual({ block: true, reason: expect.stringContaining("Access denied") });
+		expect(r2?.reason).toContain("use pluck_read over cat");
 	});
 });

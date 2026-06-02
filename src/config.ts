@@ -83,6 +83,22 @@ export interface AgentTimeout {
 	windowSeconds: number;
 }
 
+/**
+ * Configures automatic nudge→deny escalation when the agent ignores nudges
+ * too many times for the same rule in a rolling window.
+ *
+ * When the same nudge rule fires `maxNudges` times within `windowSeconds`
+ * seconds, the next occurrence is escalated to a hard deny with a strong
+ * message demanding the agent change its approach. The per-rule counter resets
+ * after escalation.
+ */
+export interface NudgeTimeout {
+	/** Number of nudges for the same rule within `windowSeconds` that triggers escalation. */
+	maxNudges: number;
+	/** Rolling window size in seconds. */
+	windowSeconds: number;
+}
+
 export interface ControlsConfig {
 	policies?: Record<string, Policy>;
 	locations?: Record<string, string>;
@@ -102,6 +118,11 @@ export interface ControlsConfig {
 	 * too many times in a rolling window.
 	 */
 	agentTimeout?: AgentTimeout | null;
+	/**
+	 * Optional circuit-breaker: escalate nudge→deny when the agent ignores
+	 * the same nudge rule too many times in a rolling window.
+	 */
+	nudgeTimeout?: NudgeTimeout | null;
 }
 
 export interface ControlsResolvedConfig {
@@ -110,6 +131,7 @@ export interface ControlsResolvedConfig {
 	defaultPolicy: string | null;
 	cycleKey: string;
 	agentTimeout: AgentTimeout | null;
+	nudgeTimeout: NudgeTimeout | null;
 }
 
 const DEFAULTS: ControlsResolvedConfig = {
@@ -118,6 +140,7 @@ const DEFAULTS: ControlsResolvedConfig = {
 	defaultPolicy: null,
 	cycleKey: "ctrl+shift+m",
 	agentTimeout: null,
+	nudgeTimeout: null,
 };
 
 // ─── File discovery ───────────────────────────────────────────────────────────

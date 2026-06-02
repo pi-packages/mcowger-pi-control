@@ -24,6 +24,31 @@ export const pendingNudges = new Map<string, string>();
  */
 export const denyTracker = new DenyTracker();
 
+/**
+ * Per-rule sliding-window nudge counters for the nudgeTimeout circuit breaker.
+ * Keyed by "tool:pattern" (pattern omitted for non-bash rules). Exported so
+ * tests can inspect and reset individual counters between runs.
+ */
+export const nudgeTrackers = new Map<string, DenyTracker>();
+
+/** Return (creating if absent) the nudge tracker for a given rule key. */
+function getNudgeTracker(key: string): DenyTracker {
+	let tracker = nudgeTrackers.get(key);
+	if (!tracker) {
+		tracker = new DenyTracker();
+		nudgeTrackers.set(key, tracker);
+	}
+	return tracker;
+}
+
+/**
+ * Build the canonical key used to track nudge counts for a rule.
+ * tool:pattern — pattern omitted for tool-level (non-bash) rules.
+ */
+export function nudgeKey(tool: string, pattern?: string): string {
+	return pattern !== undefined ? `${tool}:${pattern}` : tool;
+}
+
 function getTargetPaths(event: ToolCallEvent, cwd: string): string[] {
 	if (event.toolName === "bash") return [];
 	const input = event.input as Record<string, unknown>;
@@ -95,6 +120,7 @@ async function executeAction(
 	matchedPattern?: string,
 	toolCallId?: string,
 	nudgeMessage?: string,
+	escalatedFromNudge?: string,
 ): Promise<ToolCallEventResult | undefined> {
 	switch (action) {
 		case "allow":
@@ -135,12 +161,49 @@ async function executeAction(
 				deniedPaths.length > 0
 					? ` The restriction is on the PATH${deniedPaths.length > 1 ? "S" : ""} ${deniedPaths.map((p) => `"${p}"`).join(", ")} — not on the tool. Do NOT retry with a different tool (read, ls, glob, cat, etc.); all access to these paths is blocked.`
 					: " Do NOT retry with a different tool; this path is blocked regardless of which tool is used.";
+			const nudgeNote = escalatedFromNudge
+				? ` You were repeatedly warned: "${escalatedFromNudge}". You MUST switch approach now.`
+				: "";
 			return {
 				block: true,
-				reason: `[pi-controls] Access denied by policy: ${toolName}${cmdPart}${context}.${pathNote}`,
+				reason: `[pi-controls] Access denied by policy: ${toolName}${cmdPart}${context}.${pathNote}${nudgeNote}`,
 			};
 		}
 	}
+}
+
+/**
+ * Apply the nudgeTimeout circuit breaker.
+ *
+ * If the resolved action is "nudge" and nudgeTimeout is configured:
+ *  - Record the nudge in the per-rule tracker.
+ *  - If the threshold has been reached for this rule, escalate to "deny" so
+ *    the agent is forced to change approach. Reset the counter after escalation
+ *    so the cycle can begin again if the agent keeps trying.
+ *
+ * Returns the (possibly escalated) action, and the nudge key used for tracking.
+ */
+function applyNudgeTimeout(
+	action: Action,
+	ruleKey: string,
+	config: ControlsResolvedConfig,
+	ctx: ExtensionContext,
+): Action {
+	if (action !== "nudge") return action;
+	const timeout = config.nudgeTimeout;
+	if (!timeout) return action;
+
+	const tracker = getNudgeTracker(ruleKey);
+	tracker.record();
+	if (tracker.isTriggered(timeout.maxNudges, timeout.windowSeconds)) {
+		tracker.reset();
+		ctx.ui.notify(
+			`[pi-controls] nudgeTimeout: repeated nudge ignored ${timeout.maxNudges} times — escalating to deny`,
+			"error",
+		);
+		return "deny";
+	}
+	return action;
 }
 
 /**
@@ -191,6 +254,7 @@ export async function handleToolCall(
 			action: Action;
 			matchedPattern?: string;
 			nudgeMessage?: string;
+			ruleKey?: string;
 		}[] = [];
 		const targets: string[] = [];
 		let policyName: string | null = null;
@@ -211,11 +275,12 @@ export async function handleToolCall(
 						"bash",
 						stage.command,
 					);
-					matchResults.push({
-						action: result.action,
-						matchedPattern: result.matchedPattern,
-						nudgeMessage: result.nudgeMessage,
-					});
+				matchResults.push({
+					action: result.action,
+					matchedPattern: result.matchedPattern,
+					nudgeMessage: result.nudgeMessage,
+					ruleKey: nudgeKey("bash", result.matchedPattern),
+				});
 				}
 			}
 		}
@@ -242,10 +307,12 @@ export async function handleToolCall(
 			.map((r) => r.matchedPattern!)
 			.sort((a, b) => b.length - a.length)[0];
 
-		// Pick the nudge message from any result that contributed to the final action.
-		const nudgeMessage = matchResults.find(
+		// Pick the nudge message and rule key from any result that contributed to the final action.
+		const nudgeMatch = matchResults.find(
 			(r) => r.action === finalAction && r.nudgeMessage !== undefined,
-		)?.nudgeMessage;
+		);
+		const nudgeMessage = nudgeMatch?.nudgeMessage;
+		const bashNudgeKey = nudgeMatch?.ruleKey ?? nudgeKey("bash", matchedPattern);
 
 		const deniedTargets = finalAction === "deny" ? targets : [];
 
@@ -270,22 +337,30 @@ export async function handleToolCall(
 			nudgeMessage,
 		);
 		if (mode === "inform") return undefined;
-		const effectiveBashAction = applyAgentTimeout(finalAction, config, ctx);
+		const effectiveBashAction = applyNudgeTimeout(
+			applyAgentTimeout(finalAction, config, ctx),
+			bashNudgeKey,
+			config,
+			ctx,
+		);
+		const bashEscalatedFromNudge =
+			finalAction === "nudge" && effectiveBashAction === "deny" ? nudgeMessage : undefined;
 		return executeAction(
 			effectiveBashAction,
 			"bash",
 			cmd,
 			ctx,
-			deniedTargets,
+			effectiveBashAction === "deny" ? targets : deniedTargets,
 			matchedPattern,
 			event.toolCallId,
 			nudgeMessage,
+			bashEscalatedFromNudge,
 		);
 	}
 
 	// ── Non-bash ──────────────────────────────────────────────────────────────
 	const targets = getTargetPaths(event, cwd);
-	const matchResults: { action: Action; nudgeMessage?: string }[] = [];
+	const matchResults: { action: Action; nudgeMessage?: string; ruleKey: string }[] = [];
 	let policyName: string | null = null;
 
 	for (const target of targets) {
@@ -293,7 +368,11 @@ export async function handleToolCall(
 		if (resolved) {
 			policyName = resolved.name;
 			const result = matchRuleWithDetails(resolved.policy, event.toolName, null);
-			matchResults.push({ action: result.action, nudgeMessage: result.nudgeMessage });
+			matchResults.push({
+				action: result.action,
+				nudgeMessage: result.nudgeMessage,
+				ruleKey: nudgeKey(event.toolName),
+			});
 		}
 	}
 
@@ -311,9 +390,11 @@ export async function handleToolCall(
 
 	const actions = matchResults.map((r) => r.action);
 	const finalAction = mostRestrictive(actions);
-	const nudgeMessage = matchResults.find(
+	const nudgeMatch = matchResults.find(
 		(r) => r.action === finalAction && r.nudgeMessage !== undefined,
-	)?.nudgeMessage;
+	);
+	const nudgeMessage = nudgeMatch?.nudgeMessage;
+	const toolNudgeKey = nudgeMatch?.ruleKey ?? nudgeKey(event.toolName);
 
 	await logDecision({
 		ts: new Date().toISOString(),
@@ -335,15 +416,23 @@ export async function handleToolCall(
 		nudgeMessage,
 	);
 	if (mode === "inform") return undefined;
-	const effectiveAction = applyAgentTimeout(finalAction, config, ctx);
+	const effectiveAction = applyNudgeTimeout(
+		applyAgentTimeout(finalAction, config, ctx),
+		toolNudgeKey,
+		config,
+		ctx,
+	);
+	const escalatedFromNudge =
+		finalAction === "nudge" && effectiveAction === "deny" ? nudgeMessage : undefined;
 	return executeAction(
 		effectiveAction,
 		event.toolName,
 		null,
 		ctx,
-		targets,
+		effectiveAction === "deny" ? targets : [],
 		undefined,
 		event.toolCallId,
 		nudgeMessage,
+		escalatedFromNudge,
 	);
 }
