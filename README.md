@@ -3,7 +3,7 @@
 
 A [pi](https://github.com/earendil-works/pi) extension that enforces action-based policies on tool calls, scoped by filesystem location.
 
-When the agent tries to run a bash command, read a file, write to a path, or call any other tool, pi-controls checks which policy governs that location and either allows, logs, asks for confirmation, or denies the call — before execution.
+When the agent tries to run a bash command, read a file, write to a path, or call any other tool, pi-controls checks which policy governs that location and either allows, nudges, logs, asks for confirmation, or denies the call — before execution.
 
 ---
 
@@ -31,6 +31,7 @@ When the agent tries to run a bash command, read a file, write to a path, or cal
   - [Layered home and project policies](#layered-home-and-project-policies)
   - [Redirect-aware bash policies](#redirect-aware-bash-policies)
   - [Mixed restrictiveness across pipeline stages](#mixed-restrictiveness-across-pipeline-stages)
+  - [Nudge toward better tools](#nudge-toward-better-tools)
 - [Config Reference](#config-reference)
 - [Development](#development)
 
@@ -198,14 +199,18 @@ Each rule has:
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `action` | always | `"allow"`, `"ask"`, `"deny"`, or `"log"` |
+| `action` | always | `"allow"`, `"nudge"`, `"ask"`, `"deny"`, or `"log"` |
 | `tool` | always | Tool name or glob (e.g. `"bash"`, `"github_*"`, `"*"`) |
 | `pattern` | bash only | Glob matched against the full command string |
+| `message` | nudge only | Reminder injected into the tool result when action is `"nudge"` |
 
 `pattern` is only evaluated when `tool` is `"bash"`. For all other tools, the location boundary is the only scope — no pattern is needed or used.
 
+`message` is required when `action` is `"nudge"` and ignored for all other actions.
+
 ```json
 { "action": "allow", "tool": "read" }
+{ "action": "nudge", "tool": "read",  "message": "Prefer pluck_read for repo files." }
 { "action": "deny",  "tool": "write" }
 { "action": "ask",   "tool": "bash", "pattern": "git push *" }
 { "action": "log",   "tool": "github_*" }
@@ -217,11 +222,12 @@ Each rule has:
 | Action | Behavior |
 |--------|----------|
 | `allow` | Silent permit. Tool call proceeds with no interruption. |
+| `nudge` | Tool call proceeds, **and** the `message` is appended to the tool result so the LLM sees it inline. A warning is also shown in the pi UI. Use this to guide the agent toward better alternatives without blocking it. |
 | `log` | Tool call proceeds, but a notification is shown in the pi UI. Useful for auditing. |
 | `ask` | Execution pauses and pi asks for confirmation. Approved → proceeds. Denied → blocked, and the LLM receives a reason message. |
 | `deny` | Tool call is blocked immediately. The LLM receives a reason message. |
 
-`defaultAction` follows the same four behaviors and is used when no rule in the policy matches the current tool call.
+`defaultAction` follows the same behaviors and is used when no rule in the policy matches the current tool call. `"nudge"` is not valid as a `defaultAction` — it requires a `message` field which only makes sense on explicit rules.
 
 ### Feedback Messages
 
@@ -326,7 +332,7 @@ Running `git status`:
 - Only `"git *"` matches (score 4).
 - Result → **allow**.
 
-**Tiebreaker:** when two rules have the same specificity score, `allow > ask > deny > log`. This means the least-disruptive action wins ties — you never accidentally block something more than the rules intend.
+**Tiebreaker:** when two rules have the same specificity score, the least-disruptive action wins: `allow > nudge > ask > deny > log`. You never accidentally block something more than the rules intend.
 
 ```json
 { "action": "allow", "tool": "bash", "pattern": "git *" },
@@ -335,13 +341,20 @@ Running `git status`:
 
 Both score 4. Tiebreaker: **allow** wins.
 
+```json
+{ "action": "nudge", "tool": "bash", "pattern": "grep *", "message": "prefer rg" },
+{ "action": "deny",  "tool": "bash", "pattern": "grep *" }
+```
+
+Both score 5. Tiebreaker: **nudge** wins (less disruptive than deny).
+
 ---
 
 ## Multi-Target Resolution
 
 When a bash command touches files in multiple locations — through redirect targets — each location's policy is evaluated independently. The **most restrictive** action across all of them wins.
 
-Restrictiveness order: `deny > ask > log > allow`
+Restrictiveness order: `deny > ask > log > nudge > allow`
 
 **Example config:**
 
@@ -419,7 +432,7 @@ Place `"$safe-bash"` as an entry in `rules`. It mixes freely with regular rule o
         { "action": "allow", "tool": "ls" },
         { "action": "deny",  "tool": "write" },
         { "action": "deny",  "tool": "edit" },
-        { "action": "allow", "tool": "bash", "pattern": "$safe-bash" } // expands to ~90 rules
+        { "action": "allow", "tool": "bash", "pattern": "$safe-bash" }  // expands to ~90 rules
       ]
     }
   }
@@ -722,6 +735,45 @@ The `curl` stage is denied, which locks the entire pipeline regardless of what t
 
 ---
 
+### Nudge toward better tools
+
+Allow a tool call but inject a reminder into the result so the LLM is guided toward a preferred alternative — without blocking it outright. This is useful for steering agents toward domain-specific or more efficient tools without hard enforcement.
+
+```json
+{
+  "policies": {
+    "guided": {
+      "defaultAction": "allow",
+      "rules": [
+        { "action": "nudge", "tool": "read",  "message": "Prefer pluck_read for repo files — it provides outline mode and semantic context." },
+        { "action": "nudge", "tool": "grep",  "message": "Prefer pluck_grep for content search — it understands code structure." },
+        { "action": "nudge", "tool": "bash",  "pattern": "grep *", "message": "Prefer rg (ripgrep) over grep — faster and .gitignore-aware." }
+      ]
+    }
+  },
+  "locations": {
+    "$cwd": "guided"
+  }
+}
+```
+
+When the agent calls `read`, it still gets the file contents — but the tool result also contains:
+
+```
+[pi-controls nudge] Prefer pluck_read for repo files — it provides outline mode and semantic context.
+```
+
+A warning notification is also shown in the pi UI. The LLM can act on the hint immediately or on its next turn.
+
+**Nudge vs. other actions:**
+- Unlike `log`, nudge surfaces the message *inside the tool result* where the LLM sees it directly, not just in the UI.
+- Unlike `deny`, nudge never blocks — the agent always gets its result.
+- Unlike `ask`, nudge requires no human interaction.
+
+**Restrictiveness:** nudge is treated as less restrictive than `log` when multiple location policies are combined. If one location says `nudge` and another says `deny` for the same tool call, `deny` wins.
+
+---
+
 ## Config Reference
 
 ### Top-level fields
@@ -743,9 +795,10 @@ The `curl` stage is denied, which locks the entire pipeline regardless of what t
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `action` | `"allow" \| "ask" \| "deny" \| "log"` | Yes | What to do when this rule matches. |
+| `action` | `"allow" \| "nudge" \| "ask" \| "deny" \| "log"` | Yes | What to do when this rule matches. |
 | `tool` | `string` | Yes | Tool name or glob. Wildcards: `*` (any chars), `?` (one char). |
 | `pattern` | `string` | bash only | Glob matched against the full command string. Only used when `tool` is `"bash"`. |
+| `message` | `string` | nudge only | Reminder text appended to the tool result and shown in the UI. Required when `action` is `"nudge"`. |
 
 ### Glob syntax
 
@@ -777,16 +830,18 @@ Tests live in `tests/` and use `bun:test`. Each utility module has its own test 
 
 ```
 src/
-  index.ts          # Extension entry point
+  index.ts          # Extension entry point; registers tool_call and tool_result handlers
   config.ts         # Config schema and ConfigLoader setup
   hooks/
-    tool-call.ts    # Main tool_call event handler
+    tool-call.ts    # tool_call handler; exports pendingNudges map for nudge injection
   utils/
     path.ts         # Path normalization and ~ expansion
     location.ts     # Path → policy resolution
     matching.ts     # Rule matching, specificity scoring, action resolution
     bash-ast.ts     # bash-parser wrapper with regex fallback
 tests/
+  hooks/
+    tool-call.test.ts
   utils/
     path.test.ts
     location.test.ts

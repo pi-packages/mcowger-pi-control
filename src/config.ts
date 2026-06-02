@@ -18,12 +18,14 @@ import { SAFE_BASH_PATTERNS } from "./utils/safe-commands.js";
 
 // ─── Schema types ─────────────────────────────────────────────────────────────
 
-export type Action = "allow" | "ask" | "deny" | "log";
+export type Action = "allow" | "ask" | "deny" | "log" | "nudge";
 
 export interface Rule {
 	action: Action;
 	tool: string;
 	pattern?: string; // bash only
+	/** Required when action is "nudge": the reminder message injected into the tool result. */
+	message?: string;
 }
 
 export interface Policy {

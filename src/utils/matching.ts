@@ -45,9 +45,10 @@ export function specificityScore(pattern: string): number {
 /** Tiebreaker: lower number = higher priority in a tie. */
 const ACTION_PRIORITY: Record<Action, number> = {
 	allow: 0,
-	ask: 1,
-	deny: 2,
-	log: 3,
+	nudge: 1,
+	ask: 2,
+	deny: 3,
+	log: 4,
 };
 
 /** Result of matching a rule — action plus optional pattern that matched. */
@@ -55,6 +56,8 @@ export interface MatchResult {
 	action: Action;
 	/** For bash with a pattern match, the specific pattern that matched. */
 	matchedPattern?: string;
+	/** For nudge rules, the reminder message to inject into the tool result. */
+	nudgeMessage?: string;
 }
 
 // ─── Rule matching ────────────────────────────────────────────────────────────
@@ -83,6 +86,7 @@ export function matchRuleWithDetails(
 	let bestPriority = Number.MAX_SAFE_INTEGER;
 	let bestAction: Action | null = null;
 	let bestPattern: string | undefined;
+	let bestNudgeMessage: string | undefined;
 	for (const rule of policy.rules) {
 		// Tool glob must match.
 		if (!matchTool(rule.tool, toolName)) continue;
@@ -106,19 +110,21 @@ export function matchRuleWithDetails(
 			bestPriority = priority;
 			bestAction = rule.action;
 			bestPattern = patternMatched ? rule.pattern : undefined;
+			bestNudgeMessage = rule.action === "nudge" ? rule.message : undefined;
 		}
 	}
 
 	return {
 		action: bestAction ?? policy.defaultAction,
 		matchedPattern: bestPattern,
+		nudgeMessage: bestNudgeMessage,
 	};
 }
 
 // ─── Multi-target resolution ──────────────────────────────────────────────────
 
-/** Restrictiveness order: deny > ask > log > allow */
-const RESTRICTIVENESS: Action[] = ["deny", "ask", "log", "allow"];
+/** Restrictiveness order: deny > ask > log > nudge > allow */
+const RESTRICTIVENESS: Action[] = ["deny", "ask", "log", "nudge", "allow"];
 
 /**
  * Given actions from multiple policies (one per target), return the most

@@ -1,6 +1,6 @@
 import { describe, expect, it, beforeAll, mock } from "bun:test"; // mock kept for ctx stubs
 import { initBashParser } from "../../src/utils/bash-ast.js";
-import { handleToolCall } from "../../src/hooks/tool-call.js";
+import { handleToolCall, pendingNudges } from "../../src/hooks/tool-call.js";
 import type { ControlsResolvedConfig } from "../../src/config.js";
 import type {
 	BashToolCallEvent,
@@ -27,12 +27,25 @@ function makeCtx(cwd: string): ExtensionContext {
 	} as any;
 }
 
-function bashEvent(command: string): BashToolCallEvent {
+function bashEvent(command: string, id = "test-id"): BashToolCallEvent {
 	return {
 		type: "tool_call",
-		toolCallId: "test-id",
+		toolCallId: id,
 		toolName: "bash",
 		input: { command },
+	};
+}
+
+function toolEvent(
+	toolName: string,
+	id = "test-id",
+	extraInput: Record<string, unknown> = {},
+): any {
+	return {
+		type: "tool_call",
+		toolCallId: id,
+		toolName,
+		input: { ...extraInput },
 	};
 }
 
@@ -111,5 +124,48 @@ describe("tool-call handler — path arg location resolution", () => {
 			block: true,
 			reason: expect.stringContaining("Access denied"),
 		});
+	});
+});
+
+describe("nudge action", () => {
+	const nudgeConfig: ControlsResolvedConfig = {
+		policies: {
+			nudged: {
+				defaultAction: "allow",
+				rules: [
+					{
+						action: "nudge",
+						tool: "read",
+						message: "use pluck_read instead",
+					},
+				],
+			},
+		},
+		locations: { "/tmp": "nudged" },
+		defaultPolicy: null,
+	};
+
+	it("allows the tool call (returns undefined) when action is nudge", async () => {
+		const event = toolEvent("read", "nudge-call-1", {
+			file_path: "/tmp/foo.ts",
+		});
+		const result = await handleToolCall(event, makeCtx("/tmp"), nudgeConfig);
+		expect(result).toBeUndefined();
+	});
+
+	it("registers a pending nudge keyed by toolCallId", async () => {
+		pendingNudges.clear();
+		const event = toolEvent("read", "nudge-call-2", {
+			file_path: "/tmp/bar.ts",
+		});
+		await handleToolCall(event, makeCtx("/tmp"), nudgeConfig);
+		expect(pendingNudges.get("nudge-call-2")).toBe("use pluck_read instead");
+	});
+
+	it("does not register a pending nudge for allowed (non-nudge) tools", async () => {
+		pendingNudges.clear();
+		const event = toolEvent("grep", "nudge-call-3");
+		await handleToolCall(event, makeCtx("/tmp"), nudgeConfig);
+		expect(pendingNudges.has("nudge-call-3")).toBe(false);
 	});
 });

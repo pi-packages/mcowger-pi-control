@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
 	matchRule,
+	matchRuleWithDetails,
 	mostRestrictive,
 	specificityScore,
 } from "../../src/utils/matching.js";
@@ -33,6 +34,13 @@ describe("mostRestrictive", () => {
 
 	it("log beats allow", () => {
 		expect(mostRestrictive(["allow", "log"])).toBe("log");
+	});
+
+	it("nudge beats allow but loses to log", () => {
+		expect(mostRestrictive(["allow", "nudge"])).toBe("nudge");
+		expect(mostRestrictive(["nudge", "log"])).toBe("log");
+		expect(mostRestrictive(["nudge", "ask"])).toBe("ask");
+		expect(mostRestrictive(["nudge", "deny"])).toBe("deny");
 	});
 
 	it("defaults to allow for empty list", () => {
@@ -127,5 +135,57 @@ describe("matchRule", () => {
 		const multiLineCommit =
 			'git commit -m "feat: do something\n\n- detail one\n- detail two"';
 		expect(matchRule(policy, "bash", multiLineCommit)).toBe("ask");
+	});
+});
+
+describe("nudge action", () => {
+	const nudgePolicy: Policy = {
+		defaultAction: "allow",
+		rules: [
+			{ action: "nudge", tool: "read", message: "use pluck_read instead" },
+			{ action: "nudge", tool: "grep", message: "use pluck_grep instead" },
+		],
+	};
+
+	it("returns nudge action for a matching tool", () => {
+		expect(matchRule(nudgePolicy, "read", null)).toBe("nudge");
+	});
+
+	it("returns nudge action for another matching tool", () => {
+		expect(matchRule(nudgePolicy, "grep", null)).toBe("nudge");
+	});
+
+	it("returns allow (defaultAction) for a non-nudged tool", () => {
+		expect(matchRule(nudgePolicy, "write", null)).toBe("allow");
+	});
+
+	it("matchRuleWithDetails includes the nudgeMessage", () => {
+		const result = matchRuleWithDetails(nudgePolicy, "read", null);
+		expect(result.action).toBe("nudge");
+		expect(result.nudgeMessage).toBe("use pluck_read instead");
+	});
+
+	it("nudge message is undefined when action is not nudge", () => {
+		const result = matchRuleWithDetails(nudgePolicy, "write", null);
+		expect(result.action).toBe("allow");
+		expect(result.nudgeMessage).toBeUndefined();
+	});
+
+	it("at equal specificity, nudge (more permissive) wins over deny in single-rule match — deny must come from mostRestrictive", () => {
+		// Within a single policy, the tiebreaker is most-permissive wins (lower ACTION_PRIORITY number).
+		// nudge (1) < deny (3) → nudge wins the single-rule match.
+		// To combine nudge + deny across targets use mostRestrictive(), which gives deny.
+		const mixedPolicy: Policy = {
+			defaultAction: "allow",
+			rules: [
+				{ action: "nudge", tool: "read", message: "use pluck_read" },
+				{ action: "deny", tool: "read" },
+			],
+		};
+		expect(matchRule(mixedPolicy, "read", null)).toBe("nudge");
+	});
+
+	it("mostRestrictive correctly picks deny over nudge", () => {
+		expect(mostRestrictive(["nudge", "deny"])).toBe("deny");
 	});
 });

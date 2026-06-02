@@ -11,6 +11,12 @@ import { normalizePath } from "../utils/path.js";
 import { parseCommand } from "../utils/bash-ast.js";
 import { logDecision } from "../utils/logger.js";
 
+/**
+ * Nudge messages pending injection into tool results, keyed by toolCallId.
+ * Populated during tool_call handling; consumed during tool_result handling.
+ */
+export const pendingNudges = new Map<string, string>();
+
 function getTargetPaths(event: ToolCallEvent, cwd: string): string[] {
 	if (event.toolName === "bash") return [];
 	const input = event.input as Record<string, unknown>;
@@ -47,6 +53,7 @@ function notifyDecision(
 	mode: ControlsMode = "enforce",
 	deniedPaths: string[] = [],
 	matchedPattern?: string,
+	nudgeMessage?: string,
 ): void {
 	// In inform mode show everything (including allow) so user sees the full picture.
 	// In enforce mode, allow is silent — only show non-allow decisions.
@@ -67,6 +74,9 @@ function notifyDecision(
 					? "warning"
 					: "info";
 	ctx.ui.notify(`pi-controls: ${label}${policy}${cmd}${context}`, type);
+	if (action === "nudge" && nudgeMessage) {
+		ctx.ui.notify(`pi-controls nudge: ${nudgeMessage}`, "warning");
+	}
 }
 
 async function executeAction(
@@ -76,6 +86,8 @@ async function executeAction(
 	ctx: ExtensionContext,
 	deniedPaths: string[] = [],
 	matchedPattern?: string,
+	toolCallId?: string,
+	nudgeMessage?: string,
 ): Promise<ToolCallEventResult | undefined> {
 	switch (action) {
 		case "allow":
@@ -83,6 +95,14 @@ async function executeAction(
 
 		case "log":
 			return undefined;
+
+		case "nudge": {
+			// Allow the tool call but register a message to be injected into the result.
+			if (toolCallId && nudgeMessage) {
+				pendingNudges.set(toolCallId, nudgeMessage);
+			}
+			return undefined;
+		}
 
 		case "ask": {
 			const context = buildContextSuffix(deniedPaths, matchedPattern);
@@ -126,7 +146,11 @@ export async function handleToolCall(
 		const stages = await parseCommand(input.command);
 		const cmd = stages.map((s) => s.command).join(" | ");
 
-		const matchResults: { action: Action; matchedPattern?: string }[] = [];
+		const matchResults: {
+			action: Action;
+			matchedPattern?: string;
+			nudgeMessage?: string;
+		}[] = [];
 		const targets: string[] = [];
 		let policyName: string | null = null;
 
@@ -149,6 +173,7 @@ export async function handleToolCall(
 					matchResults.push({
 						action: result.action,
 						matchedPattern: result.matchedPattern,
+						nudgeMessage: result.nudgeMessage,
 					});
 				}
 			}
@@ -176,6 +201,11 @@ export async function handleToolCall(
 			.map((r) => r.matchedPattern!)
 			.sort((a, b) => b.length - a.length)[0];
 
+		// Pick the nudge message from any result that contributed to the final action.
+		const nudgeMessage = matchResults.find(
+			(r) => r.action === finalAction && r.nudgeMessage !== undefined,
+		)?.nudgeMessage;
+
 		const deniedTargets = finalAction === "deny" ? targets : [];
 
 		await logDecision({
@@ -196,6 +226,7 @@ export async function handleToolCall(
 			mode,
 			deniedTargets,
 			matchedPattern,
+			nudgeMessage,
 		);
 		if (mode === "inform") return undefined;
 		return executeAction(
@@ -205,25 +236,26 @@ export async function handleToolCall(
 			ctx,
 			deniedTargets,
 			matchedPattern,
+			event.toolCallId,
+			nudgeMessage,
 		);
 	}
 
 	// ── Non-bash ──────────────────────────────────────────────────────────────
 	const targets = getTargetPaths(event, cwd);
-	const actions: Action[] = [];
+	const matchResults: { action: Action; nudgeMessage?: string }[] = [];
 	let policyName: string | null = null;
 
 	for (const target of targets) {
 		const resolved = resolvePolicy(target, cwd, config);
 		if (resolved) {
 			policyName = resolved.name;
-			actions.push(
-				matchRuleWithDetails(resolved.policy, event.toolName, null).action,
-			);
+			const result = matchRuleWithDetails(resolved.policy, event.toolName, null);
+			matchResults.push({ action: result.action, nudgeMessage: result.nudgeMessage });
 		}
 	}
 
-	if (actions.length === 0) {
+	if (matchResults.length === 0) {
 		await logDecision({
 			ts: new Date().toISOString(),
 			tool: event.toolName,
@@ -235,7 +267,12 @@ export async function handleToolCall(
 		return undefined;
 	}
 
+	const actions = matchResults.map((r) => r.action);
 	const finalAction = mostRestrictive(actions);
+	const nudgeMessage = matchResults.find(
+		(r) => r.action === finalAction && r.nudgeMessage !== undefined,
+	)?.nudgeMessage;
+
 	await logDecision({
 		ts: new Date().toISOString(),
 		tool: event.toolName,
@@ -252,7 +289,18 @@ export async function handleToolCall(
 		policyName,
 		mode,
 		targets,
+		undefined,
+		nudgeMessage,
 	);
 	if (mode === "inform") return undefined;
-	return executeAction(finalAction, event.toolName, null, ctx, targets);
+	return executeAction(
+		finalAction,
+		event.toolName,
+		null,
+		ctx,
+		targets,
+		undefined,
+		event.toolCallId,
+		nudgeMessage,
+	);
 }

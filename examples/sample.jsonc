@@ -43,9 +43,13 @@
 		"readonly": {
 			"defaultAction": "deny",
 			"rules": [
-				// File inspection tools.
-				{ "action": "allow", "tool": "read" },
-				{ "action": "allow", "tool": "grep" },
+				// "nudge" allows the tool call but appends the message to the tool result
+				// so the LLM sees the reminder inline. A warning also appears in the pi UI.
+				// The call is never blocked — the agent always gets its result.
+				{ "action": "nudge", "tool": "read", "message": "Prefer pluck_read for repo files — it provides outline mode and semantic context." },
+				{ "action": "nudge", "tool": "grep", "message": "Prefer pluck_grep for content search inside the repo — it understands code structure." },
+
+				// No better alternative for these — plain allow.
 				{ "action": "allow", "tool": "find" },
 				{ "action": "allow", "tool": "ls" },
 
