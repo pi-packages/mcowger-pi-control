@@ -17,6 +17,7 @@ When the agent tries to run a bash command, read a file, write to a path, or cal
   - [Rules](#rules)
   - [Actions](#actions)
   - [Agent Timeout](#agent-timeout)
+  - [Nudge Timeout](#nudge-timeout)
   - [Locations](#locations)
 - [Rule Matching and Specificity](#rule-matching-and-specificity)
 - [Multi-Target Resolution](#multi-target-resolution)
@@ -33,6 +34,7 @@ When the agent tries to run a bash command, read a file, write to a path, or cal
   - [Redirect-aware bash policies](#redirect-aware-bash-policies)
   - [Mixed restrictiveness across pipeline stages](#mixed-restrictiveness-across-pipeline-stages)
   - [Nudge toward better tools](#nudge-toward-better-tools)
+  - [Nudge timeout — escalating ignored nudges](#nudge-timeout--escalating-ignored-nudges)
   - [Agent timeout as a safety net](#agent-timeout-as-a-safety-net)
 - [Config Reference](#config-reference)
 - [Development](#development)
@@ -224,7 +226,7 @@ Each rule has:
 | Action | Behavior |
 |--------|----------|
 | `allow` | Silent permit. Tool call proceeds with no interruption. |
-| `nudge` | Tool call proceeds, **and** the `message` is appended to the tool result so the LLM sees it inline. A warning is also shown in the pi UI. Use this to guide the agent toward better alternatives without blocking it. |
+| `nudge` | Tool call proceeds, **and** the `message` is prepended to the tool result so the LLM sees it before any output. A warning is also shown in the pi UI. Use this to guide the agent toward better alternatives without blocking it. Pair with `nudgeTimeout` to auto-escalate to `deny` when the agent repeatedly ignores the hint. |
 | `log` | Tool call proceeds, but a notification is shown in the pi UI. Useful for auditing. |
 | `ask` | Execution pauses and pi asks for confirmation. Approved → proceeds. Denied → blocked, and the LLM receives a reason message. |
 | `deny` | Tool call is blocked immediately. The LLM receives a reason message. |
@@ -258,41 +260,79 @@ The **agent timeout** is a sliding-window circuit breaker. When an agent accumul
 
 ---
 
+### Nudge Timeout
+
+The **nudge timeout** is a per-rule sliding-window circuit breaker. When the agent ignores a nudge for the same rule too many times in a short period, the next occurrence is escalated from a soft `nudge` to a hard `deny`. The deny reason includes the original nudge message so the LLM knows exactly what it kept ignoring, plus an explicit instruction to change approach. After escalation the per-rule counter resets, giving the agent a chance to recover.
+
+```jsonc
+{
+  "nudgeTimeout": {
+    "maxNudges": 3,      // escalate after this many ignored nudges for the same rule…
+    "windowSeconds": 60  // …within this rolling window
+  }
+}
+```
+
+**How it works:**
+
+- Each nudge rule has its own sliding-window counter, keyed by tool name (for non-bash rules) or `tool:pattern` (for bash rules). `read` and `grep` nudges are tracked independently; `cat *` and `grep *` bash nudges are tracked independently.
+- Every time a nudge fires for a rule, its counter is incremented.
+- When the count within `windowSeconds` reaches `maxNudges`, the call is hard-denied instead of nudged. The deny reason contains the original nudge message and the text: *"You MUST switch approach now."*
+- The per-rule counter **resets** after escalation. The agent gets another `maxNudges` chances before the next deny, rather than being permanently locked out.
+- The window is **sliding** — old nudge events age out automatically.
+
+**Example escalation sequence** with `maxNudges: 3`:
+
+| Call # | Action |
+|--------|--------|
+| 1st `read` | nudge — reminder injected, tool proceeds |
+| 2nd `read` | nudge — reminder injected, tool proceeds |
+| 3rd `read` | **deny** — hard block with strong message, counter resets |
+| 4th `read` | nudge — counter was reset, cycle starts over |
+
+`nudgeTimeout` is optional. If absent or `null`, nudges never escalate.
+
+---
+
 ### Feedback Messages
 
-When pi-controls blocks, asks, or warns about a tool call, the message includes context to help the LLM understand what triggered the decision:
+When pi-controls acts on a tool call, it shows a notification in the pi UI and (for deny/ask) sends a reason message to the LLM.
+
+**Nudge (single line, tool proceeds):**
+```
+pi-controls: nudge [policy] — Prefer pluck_read for repo files — outline mode + semantic context.
+```
+
+**Log (tool proceeds, audited):**
+```
+pi-controls: log [policy]: write — path: "/home/user/project/src/main.ts"
+```
+
+**Ask (confirmation prompt shown to user):**
+```
+pi-controls: ask [policy]: bash — git push origin main
+```
 
 **Deny (bash with pattern match):**
 ```
-Access denied by policy: bash (git commit -m "...") — pattern: "git commit *". Avoid the blocked pattern in any retry.
+pi-controls: deny [policy]: bash (git commit -m "...") — pattern: "git commit *"
+```
+LLM receives: `Access denied by policy: bash (...) — pattern: "git commit *". Avoid the blocked pattern in any retry.`
+
+**Deny (non-bash tool or path restriction):**
+```
+pi-controls: deny [policy]: write — blocked path: "/etc/secrets"
+```
+LLM receives: `Access denied by policy: write — blocked path: "/etc/secrets". The restriction is on the PATH — not on the tool. Do NOT retry with a different tool.`
+
+**Inform mode (would-block preview, nothing actually blocked):**
+```
+pi-controls: would-deny [policy]: git commit -m "..." — pattern: "git commit *"
 ```
 
-**Deny (bash with path restriction):**
-```
-Access denied by policy: bash (...) — blocked path: "~/.config". Avoid the blocked pattern in any retry.
-```
-
-**Deny (non-bash tool):**
-```
-Access denied by policy: write — blocked path: "/etc/secrets". Avoid the blocked pattern in any retry.
-```
-
-**Ask (confirmation prompt):**
-```
-Allow bash? — pattern: "git push *"
-  └─ git push origin main
-```
-
-**Inform mode (would-block preview):**
-```
-would-deny [policy]: git commit -m "..." — pattern: "git commit *"
-```
-
-The context includes:
-- **`blocked path(s)`**: Which filesystem paths triggered the denial (for bash redirect targets, path arguments, or non-bash tool paths)
-- **`pattern`**: Which rule pattern matched and caused the action (for bash commands)
-
-This helps the LLM correct its approach without guessing — it knows exactly which path or pattern to avoid.
+Path labels in notifications:
+- **`blocked path`** — only on `deny`, where the path is genuinely inaccessible
+- **`path`** — on `log` and `ask`, where the call is still proceeding or pending approval
 
 ### Locations
 
@@ -803,6 +843,49 @@ A warning notification is also shown in the pi UI. The LLM can act on the hint i
 
 ---
 
+### Nudge timeout — escalating ignored nudges
+
+If an agent keeps using a discouraged tool despite repeated nudges, escalate automatically to a hard deny after a configurable threshold.
+
+```json
+{
+  "policies": {
+    "guided": {
+      "defaultAction": "allow",
+      "rules": [
+        { "action": "nudge", "tool": "read",  "message": "Prefer pluck_read for repo files — outline mode + semantic context, far cheaper than a raw read." },
+        { "action": "nudge", "tool": "grep",  "message": "Prefer pluck_grep for content search — ripgrep behavior, kept inside the index." },
+        { "action": "nudge", "tool": "bash",  "pattern": "cat *",  "message": "Prefer pluck_read over cat for repo files (raw:true for exact bytes)." },
+        { "action": "nudge", "tool": "bash",  "pattern": "grep *", "message": "Prefer pluck_grep over grep for repo text search." }
+      ]
+    }
+  },
+  "locations": {
+    "$cwd": "guided"
+  },
+  "nudgeTimeout": {
+    "maxNudges": 3,
+    "windowSeconds": 60
+  }
+}
+```
+
+After 3 ignored nudges for the same rule within 60 seconds, the next call is hard-denied with a reason like:
+
+```
+[pi-controls] Access denied by policy: read — blocked path: "/home/user/project/src/main.ts".
+The restriction is on the PATH "/home/user/project/src/main.ts" — not on the tool.
+Do NOT retry with a different tool; all access to these paths is blocked.
+You were repeatedly warned: "Prefer pluck_read for repo files — outline mode + semantic context,
+far cheaper than a raw read." You MUST switch approach now.
+```
+
+Each nudge rule escalates independently. The `read` counter and the `bash:grep *` counter are separate — an agent that ignores `read` nudges does not burn up the `grep` counter, and vice versa.
+
+After escalation the counter resets, so the agent gets another window of `maxNudges` chances rather than being permanently locked.
+
+---
+
 ### Agent timeout as a safety net
 
 Catch a rogue agent automatically: if it racks up three denied calls in a minute, escalate the next one to a manual confirmation instead of silently blocking it.
@@ -845,12 +928,20 @@ Pair this with a strict `defaultAction: "deny"` policy to maximize the benefit: 
 | `locations` | `Record<string, string>` | No | Maps filesystem paths to policy names. |
 | `defaultPolicy` | `string \| null` | No | Policy to apply when no location matches. `null` or absent = fail-open. |
 | `agentTimeout` | `AgentTimeout \| null` | No | Circuit breaker: escalate `deny` → `ask` when the deny rate exceeds the threshold. `null` or absent = disabled. |
+| `nudgeTimeout` | `NudgeTimeout \| null` | No | Circuit breaker: escalate `nudge` → `deny` when the same nudge rule is ignored too many times. `null` or absent = disabled. |
 
 ### AgentTimeout fields
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `maxDenies` | `number` | Yes | Number of denied calls within `windowSeconds` that triggers escalation. |
+| `windowSeconds` | `number` | Yes | Rolling window size in seconds. Events older than this are ignored. |
+
+### NudgeTimeout fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `maxNudges` | `number` | Yes | Number of nudges for the same rule within `windowSeconds` before escalating to deny. |
 | `windowSeconds` | `number` | Yes | Rolling window size in seconds. Events older than this are ignored. |
 
 ### Policy fields
@@ -867,7 +958,7 @@ Pair this with a strict `defaultAction: "deny"` policy to maximize the benefit: 
 | `action` | `"allow" \| "nudge" \| "ask" \| "deny" \| "log"` | Yes | What to do when this rule matches. |
 | `tool` | `string` | Yes | Tool name or glob. Wildcards: `*` (any chars), `?` (one char). |
 | `pattern` | `string` | bash only | Glob matched against the full command string. Only used when `tool` is `"bash"`. |
-| `message` | `string` | nudge only | Reminder text appended to the tool result and shown in the UI. Required when `action` is `"nudge"`. |
+| `message` | `string` | nudge only | Reminder text prepended to the tool result (so the LLM sees it first) and shown in the pi UI. Required when `action` is `"nudge"`. |
 
 ### Glob syntax
 
@@ -908,7 +999,7 @@ src/
     location.ts       # Path → policy resolution
     matching.ts       # Rule matching, specificity scoring, action resolution
     bash-ast.ts       # bash-parser wrapper with regex fallback
-    deny-tracker.ts   # Sliding-window deny counter for agentTimeout circuit breaker
+    deny-tracker.ts   # Sliding-window counter used by both agentTimeout and nudgeTimeout circuit breakers
 tests/
   hooks/
     tool-call.test.ts

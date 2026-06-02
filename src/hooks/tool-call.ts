@@ -61,14 +61,14 @@ function getTargetPaths(event: ToolCallEvent, cwd: string): string[] {
 }
 
 function buildContextSuffix(
-	deniedPaths: string[],
+	paths: string[],
 	matchedPattern?: string,
+	pathLabel = "blocked path",
 ): string {
 	const parts: string[] = [];
-	if (deniedPaths.length > 0) {
-		parts.push(
-			`blocked path${deniedPaths.length > 1 ? "s" : ""}: ${deniedPaths.map((p) => `"${p}"`).join(", ")}`,
-		);
+	if (paths.length > 0) {
+		const label = paths.length > 1 ? `${pathLabel}s` : pathLabel;
+		parts.push(`${label}: ${paths.map((p) => `"${p}"`).join(", ")}`);
 	}
 	if (matchedPattern !== undefined) {
 		parts.push(`pattern: "${matchedPattern}"`);
@@ -92,7 +92,6 @@ function notifyDecision(
 	if (mode !== "inform" && action === "allow") return;
 	const policy = policyName ? ` [${policyName}]` : "";
 	const cmd = command ? `: ${command.slice(0, 80)}` : "";
-	const context = buildContextSuffix(deniedPaths, matchedPattern);
 	// In inform mode: prefix non-allow actions with "would-" and always use info
 	// so it's clear nothing was actually blocked.
 	const label =
@@ -105,9 +104,14 @@ function notifyDecision(
 				: action === "ask"
 					? "warning"
 					: "info";
-	ctx.ui.notify(`pi-controls: ${label}${policy}${cmd}${context}`, type);
 	if (action === "nudge" && nudgeMessage) {
-		ctx.ui.notify(`pi-controls nudge: ${nudgeMessage}`, "warning");
+		// Single line: no path label (not blocked), nudge message inline.
+		ctx.ui.notify(`pi-controls: nudge${policy} — ${nudgeMessage}`, "warning");
+	} else {
+		// Use "path" for log/ask (not yet blocked); "blocked path" only for deny.
+		const pathLabel = action === "deny" ? "blocked path" : "path";
+		const context = buildContextSuffix(deniedPaths, matchedPattern, pathLabel);
+		ctx.ui.notify(`pi-controls: ${label}${policy}${cmd}${context}`, type);
 	}
 }
 
