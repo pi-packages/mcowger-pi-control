@@ -3,6 +3,8 @@ import { initBashParser } from "../../src/utils/bash-ast.js";
 import {
 	handleToolCall,
 	pendingNudges,
+	sessionAllows,
+	sessionAllowKey,
 	denyTracker,
 	nudgeTrackers,
 	nudgeKey,
@@ -24,6 +26,7 @@ function makeCtx(cwd: string): ExtensionContext {
 		ui: {
 			notify: mock(() => {}),
 			confirm: mock(async () => true),
+			select: mock(async () => "Allow"),
 			setStatus: mock(() => {}),
 			theme: {
 				fg: (_color: string, text: string) => text,
@@ -231,11 +234,11 @@ describe("agentTimeout escalation (deny → ask)", () => {
 		await handleToolCall(bashEvent("rm -rf /"), ctx, timeoutConfig);
 		await handleToolCall(bashEvent("rm -rf /"), ctx, timeoutConfig);
 
-		// The confirm stub returns true (user allows), so result is undefined (not blocked).
+		// The select stub returns "Allow", so result is undefined (not blocked).
 		const r3 = await handleToolCall(bashEvent("rm -rf /"), ctx, timeoutConfig);
-		// ctx.ui.confirm was called (escalation happened); since mock returns true, not blocked.
+		// ctx.ui.select was called (escalation happened); since mock returns "Allow", not blocked.
 		expect(r3).toBeUndefined();
-		expect((ctx.ui.confirm as ReturnType<typeof mock>).mock.calls.length).toBe(
+		expect((ctx.ui.select as ReturnType<typeof mock>).mock.calls.length).toBe(
 			1,
 		);
 	});
@@ -254,7 +257,7 @@ describe("agentTimeout escalation (deny → ask)", () => {
 				reason: expect.stringContaining("Access denied"),
 			});
 		}
-		expect((ctx.ui.confirm as ReturnType<typeof mock>).mock.calls.length).toBe(
+		expect((ctx.ui.select as ReturnType<typeof mock>).mock.calls.length).toBe(
 			0,
 		);
 	});
@@ -278,8 +281,8 @@ describe("agentTimeout escalation (deny → ask)", () => {
 			ctx,
 			timeoutConfig,
 		);
-		expect(r3).toBeUndefined(); // confirm returned true → not blocked
-		expect((ctx.ui.confirm as ReturnType<typeof mock>).mock.calls.length).toBe(
+		expect(r3).toBeUndefined(); // select returned "Allow" → not blocked
+		expect((ctx.ui.select as ReturnType<typeof mock>).mock.calls.length).toBe(
 			1,
 		);
 	});
@@ -293,8 +296,8 @@ describe("agentTimeout escalation (deny → ask)", () => {
 
 		// 4th denied call should still escalate (tracker still above threshold).
 		const r4 = await handleToolCall(bashEvent("rm /"), ctx, timeoutConfig);
-		expect(r4).toBeUndefined(); // confirm returned true
-		expect((ctx.ui.confirm as ReturnType<typeof mock>).mock.calls.length).toBe(
+		expect(r4).toBeUndefined(); // select returned "Allow"
+		expect((ctx.ui.select as ReturnType<typeof mock>).mock.calls.length).toBe(
 			2,
 		);
 	});
@@ -509,5 +512,212 @@ describe("nudgeTimeout escalation (nudge → deny)", () => {
 			reason: expect.stringContaining("Access denied"),
 		});
 		expect(r2?.reason).toContain("use pluck_read over cat");
+	});
+});
+
+describe("sessionAllowKey", () => {
+	it("builds key for non-bash tool with paths", () => {
+		expect(sessionAllowKey("write", null, ["/home/user/x"])).toBe(
+			"write:/home/user/x",
+		);
+	});
+
+	it("joins multiple paths sorted", () => {
+		expect(sessionAllowKey("read", null, ["/b", "/a"])).toBe("read:/a|/b");
+	});
+
+	it("uses __cwd__ when no paths", () => {
+		expect(sessionAllowKey("grep", null, [])).toBe("grep:__cwd__");
+	});
+
+	it("builds key for bash with pattern", () => {
+		expect(sessionAllowKey("bash", "rm -rf /tmp/x", ["/tmp"], "rm *")).toBe(
+			"bash:rm *:/tmp",
+		);
+	});
+
+	it("builds key for bash without pattern", () => {
+		expect(sessionAllowKey("bash", "git status", ["/home/user/project"])).toBe(
+			"bash:__default__:/home/user/project",
+		);
+	});
+
+	it("sorts paths in bash key", () => {
+		expect(sessionAllowKey("bash", "cp a b", ["/dst", "/src"], "cp *")).toBe(
+			"bash:cp *:/dst|/src",
+		);
+	});
+});
+
+describe("session allows", () => {
+	const askConfig: ControlsResolvedConfig = {
+		policies: {
+			confirm: {
+				defaultAction: "allow",
+				rules: [{ action: "ask", tool: "write" }],
+			},
+		},
+		locations: { "/tmp": "confirm" },
+		defaultPolicy: null,
+		agentTimeout: null,
+		nudgeTimeout: null,
+		cycleKey: "ctrl+shift+m",
+	};
+
+	beforeEach(() => {
+		sessionAllows.clear();
+	});
+
+	it("select is called with Allow, Allow for session, and Deny", async () => {
+		const ctx = makeCtx("/tmp");
+		await handleToolCall(
+			toolEvent("write", "sel-1", { file_path: "/tmp/foo.ts" }),
+			ctx,
+			askConfig,
+		);
+		const selectMock = ctx.ui.select as ReturnType<typeof mock>;
+		expect(selectMock.mock.calls.length).toBe(1);
+		const args = selectMock.mock.calls[0];
+		expect(args[1]).toEqual(["Allow", "Allow for session", "Deny"]);
+	});
+
+	it("allows the call when user picks Allow", async () => {
+		const ctx = makeCtx("/tmp");
+		(ctx.ui.select as ReturnType<typeof mock>).mockResolvedValueOnce("Allow");
+		const result = await handleToolCall(
+			toolEvent("write", "allow-1", { file_path: "/tmp/foo.ts" }),
+			ctx,
+			askConfig,
+		);
+		expect(result).toBeUndefined();
+		expect(sessionAllows.size).toBe(0); // not persisted for session
+	});
+
+	it("blocks the call when user picks Deny", async () => {
+		const ctx = makeCtx("/tmp");
+		(ctx.ui.select as ReturnType<typeof mock>).mockResolvedValueOnce("Deny");
+		const result = await handleToolCall(
+			toolEvent("write", "deny-1", { file_path: "/tmp/foo.ts" }),
+			ctx,
+			askConfig,
+		);
+		expect(result).toEqual({
+			block: true,
+			reason: expect.stringContaining("Blocked by user"),
+		});
+	});
+
+	it("blocks the call when select returns undefined (dismissed)", async () => {
+		const ctx = makeCtx("/tmp");
+		(ctx.ui.select as ReturnType<typeof mock>).mockResolvedValueOnce(undefined);
+		const result = await handleToolCall(
+			toolEvent("write", "dismiss-1", { file_path: "/tmp/foo.ts" }),
+			ctx,
+			askConfig,
+		);
+		expect(result).toEqual({
+			block: true,
+			reason: expect.stringContaining("Blocked by user"),
+		});
+	});
+
+	it("adds key and allows when user picks Allow for session", async () => {
+		const ctx = makeCtx("/tmp");
+		(ctx.ui.select as ReturnType<typeof mock>).mockResolvedValueOnce(
+			"Allow for session",
+		);
+		const result = await handleToolCall(
+			toolEvent("write", "sess-1", { file_path: "/tmp/foo.ts" }),
+			ctx,
+			askConfig,
+		);
+		expect(result).toBeUndefined();
+		expect(sessionAllows.has("write:/tmp/foo.ts")).toBe(true);
+	});
+
+	it("skips select on subsequent matching calls (auto-allows)", async () => {
+		// First call — user picks "Allow for session"
+		const ctx = makeCtx("/tmp");
+		(ctx.ui.select as ReturnType<typeof mock>).mockResolvedValueOnce(
+			"Allow for session",
+		);
+		await handleToolCall(
+			toolEvent("write", "auto-1", { file_path: "/tmp/foo.ts" }),
+			ctx,
+			askConfig,
+		);
+
+		// Second call to the same tool+path — should auto-allow without prompting.
+		const result2 = await handleToolCall(
+			toolEvent("write", "auto-2", { file_path: "/tmp/foo.ts" }),
+			ctx,
+			askConfig,
+		);
+		expect(result2).toBeUndefined();
+		// select was called only once (for the first call).
+		expect((ctx.ui.select as ReturnType<typeof mock>).mock.calls.length).toBe(
+			1,
+		);
+	});
+
+	it("does not auto-allow different paths", async () => {
+		const ctx = makeCtx("/tmp");
+		// Allow for session on /tmp/foo.ts
+		(ctx.ui.select as ReturnType<typeof mock>).mockResolvedValueOnce(
+			"Allow for session",
+		);
+		await handleToolCall(
+			toolEvent("write", "diff-1", { file_path: "/tmp/foo.ts" }),
+			ctx,
+			askConfig,
+		);
+
+		// Different path still asks.
+		(ctx.ui.select as ReturnType<typeof mock>).mockResolvedValueOnce("Deny");
+		const result = await handleToolCall(
+			toolEvent("write", "diff-2", { file_path: "/tmp/bar.ts" }),
+			ctx,
+			askConfig,
+		);
+		expect(result).toEqual({
+			block: true,
+			reason: expect.stringContaining("Blocked by user"),
+		});
+		expect((ctx.ui.select as ReturnType<typeof mock>).mock.calls.length).toBe(
+			2,
+		);
+	});
+
+	it("auto-allows bash with pattern after Allow for session", async () => {
+		const bashAskConfig: ControlsResolvedConfig = {
+			policies: {
+				confirm: {
+					defaultAction: "allow",
+					rules: [{ action: "ask", tool: "bash", pattern: "rm *" }],
+				},
+			},
+			locations: { "/tmp": "confirm" },
+			defaultPolicy: null,
+			agentTimeout: null,
+			nudgeTimeout: null,
+			cycleKey: "ctrl+shift+m",
+		};
+
+		const ctx = makeCtx("/tmp");
+		(ctx.ui.select as ReturnType<typeof mock>).mockResolvedValueOnce(
+			"Allow for session",
+		);
+		await handleToolCall(bashEvent("rm /tmp/foo"), ctx, bashAskConfig);
+
+		// Same pattern + same path → auto-allowed.
+		const r2 = await handleToolCall(
+			bashEvent("rm /tmp/foo"),
+			ctx,
+			bashAskConfig,
+		);
+		expect(r2).toBeUndefined();
+		expect((ctx.ui.select as ReturnType<typeof mock>).mock.calls.length).toBe(
+			1,
+		);
 	});
 });

@@ -19,6 +19,40 @@ import { DenyTracker } from "../utils/deny-tracker.js";
 export const pendingNudges = new Map<string, string>();
 
 /**
+ * Session-scoped allowlist for "Allow for session" choices.
+ * When a user selects "Allow for session" during an ask prompt, the key
+ * is stored here. Subsequent matching tool calls skip the ask and are
+ * allowed automatically for the remainder of the session.
+ *
+ * Key format:
+ *   non-bash: `toolName:paths`
+ *   bash with pattern: `bash:pattern:paths`
+ *   bash without pattern: `bash:__default__:paths`
+ * where paths is sorted and pipe-joined.
+ */
+export const sessionAllows = new Set<string>();
+
+/**
+ * Build the canonical key for the session allowlist.
+ */
+export function sessionAllowKey(
+	toolName: string,
+	command: string | null,
+	deniedPaths: string[],
+	matchedPattern?: string,
+): string {
+	const paths =
+		deniedPaths.length > 0 ? [...deniedPaths].sort().join("|") : "__cwd__";
+	if (toolName === "bash" && matchedPattern) {
+		return `bash:${matchedPattern}:${paths}`;
+	}
+	if (toolName === "bash") {
+		return `bash:__default__:${paths}`;
+	}
+	return `${toolName}:${paths}`;
+}
+
+/**
  * Sliding-window deny counter for the agentTimeout circuit breaker.
  * Exported so tests can reset it between runs.
  */
@@ -142,18 +176,32 @@ async function executeAction(
 		}
 
 		case "ask": {
-			const context = buildContextSuffix(deniedPaths, matchedPattern);
-			const label = command ? command.slice(0, 120) : toolName;
-			const detail = context.length > 0 ? context : "";
-			const confirmed = await ctx.ui.confirm(
-				`[pi-controls] Allow ${toolName}?${detail}`,
-				label,
+			const key = sessionAllowKey(
+				toolName,
+				command,
+				deniedPaths,
+				matchedPattern,
 			);
-			if (!confirmed) {
+			// Already allowed for this session — skip the prompt.
+			if (sessionAllows.has(key)) return undefined;
+
+			const context = buildContextSuffix(deniedPaths, matchedPattern);
+			const detail = context.length > 0 ? context : "";
+			const title = `[pi-controls] Allow ${toolName}?${detail}`;
+			const label = command ? command.slice(0, 120) : toolName;
+			const choice = await ctx.ui.select(title, [
+				"Allow",
+				"Allow for session",
+				"Deny",
+			]);
+			if (!choice || choice === "Deny") {
 				return {
 					block: true,
 					reason: `[pi-controls] Blocked by user: ${toolName}${command ? ` (${command.slice(0, 80)})` : ""}`,
 				};
+			}
+			if (choice === "Allow for session") {
+				sessionAllows.add(key);
 			}
 			return undefined;
 		}
@@ -357,7 +405,9 @@ export async function handleToolCall(
 			"bash",
 			cmd,
 			ctx,
-			effectiveBashAction === "deny" ? targets : deniedTargets,
+			effectiveBashAction === "deny" || effectiveBashAction === "ask"
+				? targets
+				: deniedTargets,
 			matchedPattern,
 			event.toolCallId,
 			nudgeMessage,
@@ -446,7 +496,7 @@ export async function handleToolCall(
 		event.toolName,
 		null,
 		ctx,
-		effectiveAction === "deny" ? targets : [],
+		effectiveAction === "deny" || effectiveAction === "ask" ? targets : [],
 		undefined,
 		event.toolCallId,
 		nudgeMessage,
