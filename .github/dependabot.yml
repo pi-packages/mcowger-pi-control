@@ -1,0 +1,29 @@
+# Dependabot version updates configuration.
+# Docs: https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+version: 2
+updates:
+  # Enable version updates for bun (package.json + bun.lock)
+  - package-ecosystem: "bun"
+    directory: "/"
+    # Check for updates weekly
+    schedule:
+      interval: "weekly"
+    # Group minor + patch updates into a single PR (lower breaking-change risk).
+    # Major updates are left ungrouped, so each gets its own PR for careful review.
+    groups:
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Enable version updates for GitHub Actions
+  - package-ecosystem: "github-actions"
+    # Workflow files live in `.github/workflows`; `directory: "/"` covers it.
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
